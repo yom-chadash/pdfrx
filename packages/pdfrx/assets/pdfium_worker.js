@@ -827,6 +827,13 @@ class PdfRangeCache {
     /** @type {ArrayBuffer|null} */
     this.fullData = null;
     this.bytesCached = 0;
+    // Count owned backing buffers separately from the logical range coverage.
+    this.payloadBytes = 0;
+    /** @type {Set<ArrayBuffer>} */
+    this.payloadBuffers = new Set();
+    this.hasCompleteResponse = false;
+    /** @type {Set<{offset: number, end: number, promise: Promise<boolean>}>} */
+    this.pendingDownloads = new Set();
     this.nextUnhintedBlockOffset = 0;
   }
 
@@ -855,7 +862,7 @@ class PdfRangeCache {
   }
 
   async ensureFileSize() {
-    if (this.fileSize > 0) return this.fileSize;
+    if (this.hasCompleteResponse || this.fileSize > 0) return this.fileSize;
     const response = await fetch(this.url, {
       method: 'HEAD',
       headers: this.headers,
@@ -863,6 +870,9 @@ class PdfRangeCache {
       credentials: this.fetchCredentials,
       redirect: 'follow',
     });
+    // A concurrent body may have established the size while HEAD was pending.
+    // In particular, a complete response is authoritative even after handoff.
+    if (this.hasCompleteResponse || this.fileSize > 0) return this.fileSize;
     if (!response.ok) {
       throw new Error(`Failed to get PDF file size: ${response.status} ${response.statusText}`);
     }
@@ -945,9 +955,24 @@ class PdfRangeCache {
    */
   addData(offset, data) {
     if (data.length === 0) return;
-    this.chunks.push({ offset, data });
+    const missing = this.missingRanges(offset, data.length);
+    if (missing.length === 0) return;
+    for (const range of missing) {
+      const start = range.offset - offset;
+      const end = range.end - offset;
+      // Retain a whole new payload without copying. A trimmed view would keep
+      // the overlapping bytes of its original backing buffer alive, so copy it.
+      const payload = start === 0 && end === data.length && data.byteLength === data.buffer.byteLength
+        ? data
+        : data.slice(start, end);
+      this.chunks.push({ offset: range.offset, data: payload });
+      if (!this.payloadBuffers.has(payload.buffer)) {
+        this.payloadBuffers.add(payload.buffer);
+        this.payloadBytes += payload.buffer.byteLength;
+      }
+      this.bytesCached += payload.length;
+    }
     this._addRange(offset, offset + data.length);
-    this.bytesCached = this.ranges.reduce((sum, range) => sum + range.end - range.offset, 0);
     invokeCallback(this.progressCallbackId, this.bytesCached, this.fileSize || undefined);
   }
 
@@ -961,6 +986,8 @@ class PdfRangeCache {
     this.chunks = [];
     this.ranges = [];
     this.bytesCached = 0;
+    this.payloadBytes = 0;
+    this.payloadBuffers.clear();
     return data;
   }
 
@@ -1017,9 +1044,40 @@ class PdfRangeCache {
    * @returns {Promise<boolean>} true if range access is usable; false if a complete HTTP 200 body is cached.
    */
   async download(offset, size) {
-    if (this.fullData !== null) return false;
-    const range = this.blockAlignedRange(offset, size);
-    if (!range || this.isDataAvailable(range.offset, range.end - range.offset)) return true;
+    while (!this.hasCompleteResponse) {
+      const range = this.blockAlignedRange(offset, size);
+      if (!range) return true;
+      const missing = this.missingRanges(range.offset, range.end - range.offset);
+      if (missing.length === 0) return true;
+
+      const overlapping = [...this.pendingDownloads].filter((pending) =>
+        missing.some((part) => pending.offset < part.end && part.offset < pending.end));
+      if (overlapping.length !== 0) {
+        // Recheck coverage after the shared work finishes: another caller may
+        // have filled the rest, or a server may have returned the whole PDF.
+        await Promise.all(overlapping.map((pending) => pending.promise));
+        continue;
+      }
+
+      // Reserve before starting fetch, including for reentrant custom fetches.
+      // Download holes sequentially so splitting around cached blocks does not
+      // turn one request into an unbounded batch of simultaneous transfers.
+      const pending = { ...missing[0], promise: null };
+      pending.promise = Promise.resolve()
+        .then(() => this._downloadRange(pending))
+        .finally(() => this.pendingDownloads.delete(pending));
+      this.pendingDownloads.add(pending);
+      await pending.promise;
+    }
+    return false;
+  }
+
+  /**
+   * @param {ByteRange} range
+   * @returns {Promise<boolean>}
+   */
+  async _downloadRange(range) {
+    if (this.hasCompleteResponse) return false;
 
     const response = await fetch(this.url, {
       headers: {
@@ -1030,13 +1088,18 @@ class PdfRangeCache {
       credentials: this.fetchCredentials,
       redirect: 'follow',
     });
+    if (this.hasCompleteResponse) return false;
     if (response.status === 200) {
       const data = new Uint8Array(await response.arrayBuffer());
+      if (this.hasCompleteResponse) return false;
       this.fileSize = data.length;
       // The complete response replaces any earlier partial payloads.
       this.chunks = [];
       this.ranges = [];
       this.bytesCached = 0;
+      this.payloadBytes = 0;
+      this.payloadBuffers.clear();
+      this.hasCompleteResponse = true;
       this.fullData = data.buffer;
       this.addData(0, data);
       return false;
@@ -1048,18 +1111,38 @@ class PdfRangeCache {
 
     const contentRange = response.headers.get('content-range');
     let start = range.offset;
+    let end = range.end;
     let total = this.fileSize;
     const match = /^bytes\s+(\d+)-(\d+)\/(\d+|\*)$/i.exec(contentRange);
-    if (match && match[3] !== '*') {
+    if (match) {
       start = parseInt(match[1], 10);
-      total = parseInt(match[3], 10);
+      end = parseInt(match[2], 10) + 1;
+      total = match[3] === '*' ? await this.ensureFileSize() : parseInt(match[3], 10);
     } else {
+      if (contentRange) throw new Error('Invalid PDF Content-Range response');
+      // Some CORS servers do not expose Content-Range. Preserve the existing
+      // HEAD fallback, but still require the expected number of body bytes.
       total = await this.ensureFileSize();
+      end = Math.min(end, total);
+    }
+    if (this.hasCompleteResponse) return false;
+    if (!Number.isSafeInteger(total) || total <= 0 ||
+        start !== range.offset || end <= start || end > range.end || end > total ||
+        (this.fileSize > 0 && this.fileSize !== total)) {
+      throw new Error('PDF range response does not match the requested bytes');
     }
 
     const data = new Uint8Array(await response.arrayBuffer());
     // A concurrently completed full response already owns all of these bytes.
-    if (this.fullData !== null) return false;
+    if (this.hasCompleteResponse) return false;
+    // Disjoint responses can both pass header validation before either body
+    // arrives. Check again before accepting bytes from a different revision.
+    if (this.fileSize > 0 && this.fileSize !== total) {
+      throw new Error('PDF range response file size changed during download');
+    }
+    if (data.length !== end - start) {
+      throw new Error(`Incomplete PDF range response: expected ${end - start} bytes, received ${data.length}`);
+    }
     this.fileSize = total;
     this.addData(start, data);
     return true;
@@ -1899,7 +1982,7 @@ function cancelRender(params) {
  * formHandle: number
  * }} params
  * @returns {{
- * imageData: ArrayBuffer,
+ * imageData: ArrayBuffer|null,
  * width: number,
  * height: number,
  * missingFonts: FontQueries
@@ -1969,23 +2052,26 @@ function _renderPage(params) {
       );
     }
     const src = new Uint8Array(Pdfium.memory.buffer, bufferPtr, bufferSize);
-    let copiedBuffer = new ArrayBuffer(bufferSize);
-    let dest = new Uint8Array(copiedBuffer);
-    if (flags & premultipliedAlpha) {
-      for (let i = 0; i < src.length; i += 4) {
-        const a = src[i + 3];
-        dest[i] = (src[i] * a + 128) >> 8;
-        dest[i + 1] = (src[i + 1] * a + 128) >> 8;
-        dest[i + 2] = (src[i + 2] * a + 128) >> 8;
-        dest[i + 3] = a;
-      }
-    } else {
-      dest.set(src);
-    }
-
-    // Preserve the raw rendering behavior for transparent and premultiplied images.
+    // The internal display hint is used only when Flutter does not need the raw pixels for resizing.
+    // Keep transparent/premultiplied images on the established raw path to preserve their alpha semantics.
     const useBitmap = (flags & 0x40000000) && !(flags & premultipliedAlpha) && (backgroundColor >>> 24) === 255;
     const imageBitmap = useBitmap ? _createImageBitmapFromBgra(src, width, height) : null;
+    let copiedBuffer = null;
+    if (!imageBitmap) {
+      copiedBuffer = new ArrayBuffer(bufferSize);
+      const dest = new Uint8Array(copiedBuffer);
+      if (flags & premultipliedAlpha) {
+        for (let i = 0; i < src.length; i += 4) {
+          const a = src[i + 3];
+          dest[i] = (src[i] * a + 128) >> 8;
+          dest[i + 1] = (src[i + 1] * a + 128) >> 8;
+          dest[i + 2] = (src[i + 2] * a + 128) >> 8;
+          dest[i + 3] = a;
+        }
+      } else {
+        dest.set(src);
+      }
+    }
 
     _updateMissingFonts(docHandle);
 
@@ -1997,7 +2083,7 @@ function _renderPage(params) {
         height: height,
         missingFonts: missingFonts[docHandle],
       },
-      transfer: imageBitmap ? [copiedBuffer, imageBitmap] : [copiedBuffer],
+      transfer: imageBitmap ? [imageBitmap] : [copiedBuffer],
     };
   } finally {
     Pdfium.wasmExports.FPDF_ClosePage(pageHandle);
