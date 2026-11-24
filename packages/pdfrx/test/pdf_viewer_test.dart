@@ -2423,6 +2423,21 @@ void main() {
     document.reportMissingFonts();
     await tester.pump(const Duration(milliseconds: 100));
     expect(fontManager.prepareCount, 1);
+    expect(fontManager.pendingLoad, isNotNull);
+
+    PdfFontLoadResult? result;
+    final loading = fontManager.pendingLoad!.then((value) => result = value);
+    // Native replies arrive outside fake time; the font association resumes in fake time.
+    for (var i = 0; i < 1000 && result == null; i++) {
+      await tester.runAsync(() => Future<void>.delayed(const Duration(milliseconds: 10)));
+      await tester.pump(const Duration(milliseconds: 10));
+    }
+    expect(result, isNotNull, reason: 'font loading must finish before disposing the viewer');
+    await loading;
+    expect(result!.loaded, isEmpty);
+    expect(result!.unresolved.single.face, 'Missing Font');
+    expect(result!.failed, isEmpty);
+    expect(tester.takeException(), isNull);
 
     await tester.pumpWidget(const SizedBox.shrink());
     await tester.pump(const Duration(milliseconds: 100));
@@ -3671,10 +3686,27 @@ class _TestFontManager extends PdfFontManager {
   _TestFontManager() : super(resolvers: const []);
 
   int prepareCount = 0;
+  Future<PdfFontLoadResult>? pendingLoad;
 
   @override
-  Future<void> prepare({String? fontCachePath, List<String>? fontPaths}) async {
+  Future<void> prepare({String? fontCachePath, List<String>? fontPaths}) {
     prepareCount++;
+    return super.prepare(fontCachePath: fontCachePath, fontPaths: fontPaths);
+  }
+
+  @override
+  Future<PdfFontLoadResult> loadMissingFonts(
+    Iterable<PdfFontQuery> queries, {
+    PdfFontResolveContext context = const PdfFontResolveContext(),
+    bool reloadFonts = true,
+    PdfFontLoadProgressCallback? onProgress,
+  }) {
+    return pendingLoad = super.loadMissingFonts(
+      queries,
+      context: context,
+      reloadFonts: reloadFonts,
+      onProgress: onProgress,
+    );
   }
 }
 
