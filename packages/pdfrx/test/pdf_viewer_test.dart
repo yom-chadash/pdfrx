@@ -3386,36 +3386,39 @@ void _registerNavigationLayoutTests() {
         final document = _scannedDocument(374);
         addTearDown(document.dispose);
         final controller = PdfViewerController();
-        await tester.pumpWidget(_navigationViewer(document, controller, smart: smart));
-        await _pumpPaintWork(tester);
-        final oldTarget = controller.layout.pageLayouts[279];
-        var completed = false;
-        final navigation = directMatrix
-            ? controller.goTo(controller.calcMatrixFor(oldTarget.center, zoom: 1))
-            : controller.goToPage(pageNumber: 280);
-        unawaited(navigation.then((_) => completed = true));
-        await tester.pump();
-        await tester.pump(const Duration(milliseconds: 20));
-        expect(completed, isFalse);
-        expect(controller.visibleRect.overlaps(oldTarget), isFalse);
+        try {
+          await tester.pumpWidget(_navigationViewer(document, controller, smart: smart));
+          await _pumpPaintWork(tester);
+          final oldTarget = controller.layout.pageLayouts[279];
+          var completed = false;
+          final navigation = directMatrix
+              ? controller.goTo(controller.calcMatrixFor(oldTarget.center, zoom: 1))
+              : controller.goToPage(pageNumber: 280);
+          unawaited(navigation.then((_) => completed = true));
+          await tester.pump();
+          await tester.pump(const Duration(milliseconds: 20));
+          expect(completed, isFalse);
+          expect(controller.visibleRect.overlaps(oldTarget), isFalse);
 
-        _growNavigationPages(document);
-        await tester.pump();
-        await tester.pump();
-        expect(controller.layout.pageLayouts[279].top, greaterThan(oldTarget.top));
-        await tester.pump(const Duration(milliseconds: 250));
-        expect(completed, isTrue, reason: 'relayout must settle the original Future without an application timeout');
-        expect(controller.pageNumber, 280);
-        expect(controller.visibleRect.overlaps(controller.layout.pageLayouts[279]), isTrue);
-        if (directMatrix) {
-          expect(controller.visibleRect.center.dy, closeTo(controller.layout.pageLayouts[279].center.dy, 1));
+          _growNavigationPages(document);
+          await tester.pump();
+          await tester.pump();
+          expect(controller.layout.pageLayouts[279].top, greaterThan(oldTarget.top));
+          await tester.pump(const Duration(milliseconds: 250));
+          expect(completed, isTrue, reason: 'relayout must settle the original Future without an application timeout');
+          expect(controller.pageNumber, 280);
+          expect(controller.visibleRect.overlaps(controller.layout.pageLayouts[279]), isTrue);
+          if (directMatrix) {
+            expect(controller.visibleRect.center.dy, closeTo(controller.layout.pageLayouts[279].center.dy, 1));
+          }
+          await _pumpPaintWork(tester);
+          expect(controller.visibleRenderState.value, PdfVisibleRenderState.ready);
+          expect((document.pages[279] as _TestPage).renderControl.previewsDone, greaterThan(0));
+          expect(tester.takeException(), isNull);
+        } finally {
+          await tester.pumpWidget(const SizedBox.shrink());
+          await tester.pump(const Duration(milliseconds: 100));
         }
-        await _pumpPaintWork(tester);
-        expect(controller.visibleRenderState.value, PdfVisibleRenderState.ready);
-        expect((document.pages[279] as _TestPage).renderControl.previewsDone, greaterThan(0));
-        expect(tester.takeException(), isNull);
-        await tester.pumpWidget(const SizedBox.shrink());
-        await tester.pump(const Duration(milliseconds: 100));
       });
     }
   }
