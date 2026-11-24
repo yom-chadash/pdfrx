@@ -19,6 +19,7 @@ final binding = TestWidgetsFlutterBinding.ensureInitialized();
 
 void main() {
   _registerForwardedPanZoomTests();
+  _registerNavigationLayoutTests();
   // For testing purpose, we should run on the command line
   // and pdfrxInitialize is a better way to initialize the library.
   setUp(() => pdfrxInitialize());
@@ -3375,6 +3376,239 @@ void main() {
 }
 
 enum _TestDocumentEvent { loadComplete, missingFonts }
+
+void _registerNavigationLayoutTests() {
+  for (final smart in [false, true]) {
+    for (final directMatrix in [false, true]) {
+      testWidgets('navigation retains page 280 through geometry changes (smart: $smart, matrix: $directMatrix)', (
+        tester,
+      ) async {
+        final document = _scannedDocument(374);
+        addTearDown(document.dispose);
+        final controller = PdfViewerController();
+        await tester.pumpWidget(_navigationViewer(document, controller, smart: smart));
+        await _pumpPaintWork(tester);
+        final oldTarget = controller.layout.pageLayouts[279];
+        var completed = false;
+        final navigation = directMatrix
+            ? controller.goTo(controller.calcMatrixFor(oldTarget.center, zoom: 1))
+            : controller.goToPage(pageNumber: 280);
+        unawaited(navigation.then((_) => completed = true));
+        await tester.pump();
+        await tester.pump(const Duration(milliseconds: 20));
+        expect(completed, isFalse);
+        expect(controller.visibleRect.overlaps(oldTarget), isFalse);
+
+        _growNavigationPages(document);
+        await tester.pump();
+        await tester.pump();
+        expect(controller.layout.pageLayouts[279].top, greaterThan(oldTarget.top));
+        await tester.pump(const Duration(milliseconds: 250));
+        expect(completed, isTrue, reason: 'relayout must settle the original Future without an application timeout');
+        expect(controller.pageNumber, 280);
+        expect(controller.visibleRect.overlaps(controller.layout.pageLayouts[279]), isTrue);
+        if (directMatrix) {
+          expect(controller.visibleRect.center.dy, closeTo(controller.layout.pageLayouts[279].center.dy, 1));
+        }
+        await _pumpPaintWork(tester);
+        expect(controller.visibleRenderState.value, PdfVisibleRenderState.ready);
+        expect((document.pages[279] as _TestPage).renderControl.previewsDone, greaterThan(0));
+        expect(tester.takeException(), isNull);
+        await tester.pumpWidget(const SizedBox.shrink());
+        await tester.pump(const Duration(milliseconds: 100));
+      });
+    }
+  }
+
+  for (final secondDuration in [Duration.zero, const Duration(milliseconds: 200)]) {
+    testWidgets('navigation superseded by a newer request completes without restoring the old page ($secondDuration)', (
+      tester,
+    ) async {
+      final document = _scannedDocument(374);
+      addTearDown(document.dispose);
+      final controller = PdfViewerController();
+      final notifiedPages = <int?>[];
+      await tester.pumpWidget(_navigationViewer(document, controller, onPageChanged: notifiedPages.add));
+      await _pumpPaintWork(tester);
+      var firstCompleted = false;
+      var secondCompleted = false;
+      unawaited(
+        controller.goToPage(pageNumber: 280, duration: const Duration(seconds: 1)).then((_) => firstCompleted = true),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 20));
+      expect(firstCompleted, isFalse);
+      notifiedPages.clear();
+      unawaited(controller.goToPage(pageNumber: 37, duration: secondDuration).then((_) => secondCompleted = true));
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 250));
+      await _pumpPaintWork(tester);
+      expect(firstCompleted, isTrue);
+      expect(secondCompleted, isTrue);
+      expect(controller.pageNumber, 37);
+      expect(notifiedPages, isNot(contains(280)));
+      _growNavigationPages(document);
+      await _pumpPaintWork(tester);
+      expect(controller.pageNumber, 37, reason: 'a later relayout must not revive an abandoned destination');
+      expect(controller.visibleRect.overlaps(controller.layout.pageLayouts[36]), isTrue);
+      expect(controller.visibleRenderState.value, PdfVisibleRenderState.ready);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(milliseconds: 100));
+    });
+  }
+
+  testWidgets('navigation completes on disposal without a late page callback', (tester) async {
+    final document = _scannedDocument(374);
+    addTearDown(document.dispose);
+    final controller = PdfViewerController();
+    final notifiedPages = <int?>[];
+    await tester.pumpWidget(_navigationViewer(document, controller, onPageChanged: notifiedPages.add));
+    await _pumpPaintWork(tester);
+    var completed = false;
+    unawaited(controller.goToPage(pageNumber: 280, duration: const Duration(seconds: 1)).then((_) => completed = true));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 20));
+    expect(completed, isFalse);
+    await tester.pumpWidget(const SizedBox.shrink());
+    final pagesAtDetach = notifiedPages.toList();
+    await tester.pump(const Duration(seconds: 2));
+    expect(completed, isTrue);
+    expect(controller.isReady, isFalse);
+    expect(notifiedPages, pagesAtDetach);
+    expect(notifiedPages, isNot(contains(280)));
+    expect(tester.takeException(), isNull);
+  });
+
+  testWidgets('navigation from a replaced document cannot complete on the new owner', (tester) async {
+    final first = _scannedDocument(374, sourceName: 'navigation:first');
+    final second = _scannedDocument(3, sourceName: 'navigation:second');
+    addTearDown(first.dispose);
+    addTearDown(second.dispose);
+    final controller = PdfViewerController();
+    final notifiedPages = <int?>[];
+    await tester.pumpWidget(_navigationViewer(first, controller, onPageChanged: notifiedPages.add));
+    await _pumpPaintWork(tester);
+    var completed = false;
+    unawaited(controller.goToPage(pageNumber: 280, duration: const Duration(seconds: 1)).then((_) => completed = true));
+    await tester.pump();
+    await tester.pump(const Duration(milliseconds: 20));
+    expect(completed, isFalse);
+    notifiedPages.clear();
+    await tester.pumpWidget(_navigationViewer(second, controller, onPageChanged: notifiedPages.add));
+    await _pumpPaintWork(tester);
+    await tester.pump(const Duration(seconds: 2));
+    expect(completed, isTrue);
+    expect(controller.document, same(second));
+    expect(controller.pageNumber, 1);
+    expect(notifiedPages, isNot(contains(280)));
+    expect(controller.visibleRenderState.value, PdfVisibleRenderState.ready);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(milliseconds: 100));
+  });
+
+  testWidgets('navigation started after a geometry resize wins over the deferred layout callback', (tester) async {
+    final document = _scannedDocument(374);
+    addTearDown(document.dispose);
+    final controller = PdfViewerController();
+    await tester.pumpWidget(_navigationViewer(document, controller));
+    await _pumpPaintWork(tester);
+    var completed = false;
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(controller.goToPage(pageNumber: 37, duration: Duration.zero).then((_) => completed = true));
+    });
+    _growNavigationPages(document);
+    await tester.pumpWidget(_navigationViewer(document, controller, width: 400));
+    await _pumpPaintWork(tester);
+    expect(completed, isTrue);
+    expect(controller.pageNumber, 37);
+    expect(controller.visibleRect.overlaps(controller.layout.pageLayouts[36]), isTrue);
+    expect(tester.takeException(), isNull);
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(milliseconds: 100));
+  });
+
+  for (final width in [400.0, 500.0]) {
+    testWidgets('navigation is not cut short by a rebuild with unchanged page geometry (width: $width)', (
+      tester,
+    ) async {
+      final document = _scannedDocument(374);
+      addTearDown(document.dispose);
+      final controller = PdfViewerController();
+      await tester.pumpWidget(_navigationViewer(document, controller));
+      await _pumpPaintWork(tester);
+      var completed = false;
+      unawaited(
+        controller.goToPage(pageNumber: 280, duration: const Duration(seconds: 1)).then((_) => completed = true),
+      );
+      await tester.pump();
+      await tester.pump(const Duration(milliseconds: 20));
+      await tester.pumpWidget(_navigationViewer(document, controller, width: width));
+      expect(completed, isFalse);
+      expect(controller.visibleRect.overlaps(controller.layout.pageLayouts[279]), isFalse);
+      await tester.pump(const Duration(seconds: 1));
+      await _pumpPaintWork(tester);
+      expect(completed, isTrue);
+      expect(controller.pageNumber, 280);
+      expect(tester.takeException(), isNull);
+      await tester.pumpWidget(const SizedBox.shrink());
+      await tester.pump(const Duration(milliseconds: 100));
+    });
+  }
+}
+
+Widget _navigationViewer(
+  _TestDocument document,
+  PdfViewerController controller, {
+  bool smart = false,
+  double width = 500,
+  void Function(int?)? onPageChanged,
+}) => MaterialApp(
+  home: Center(
+    child: SizedBox(
+      width: width,
+      height: 500,
+      child: PdfViewer(
+        PdfDocumentRefDirect(document, autoDispose: false),
+        controller: controller,
+        params: PdfViewerParams(
+          onPageChanged: onPageChanged,
+          sizeDelegateProvider: smart
+              ? const PdfViewerSizeDelegateProviderSmart()
+              : const PdfViewerSizeDelegateProviderLegacy(),
+          horizontalCacheExtent: 0,
+          verticalCacheExtent: 0,
+          behaviorControlParams: const PdfViewerBehaviorControlParams(
+            pageImageCachingDelay: Duration.zero,
+            partialImageLoadingDelay: Duration.zero,
+            trailingPageLoadingDelay: Duration.zero,
+          ),
+        ),
+      ),
+    ),
+  ),
+);
+
+void _growNavigationPages(_TestDocument document) {
+  final pages = document.pages.toList();
+  final changes = <int, PdfPageStatusChange>{};
+  for (var i = 0; i < 200; i++) {
+    final previous = pages[i] as _TestPage;
+    final page = _TestPage(
+      document,
+      i + 1,
+      isLoaded: true,
+      width: previous.width,
+      height: previous.height + 300,
+      renderControl: previous.renderControl,
+    );
+    pages[i] = page;
+    changes[i + 1] = PdfPageStatusChange.modified(page: page);
+  }
+  document.pages = pages;
+  document._events.add(PdfDocumentPageStatusChangedEvent(document, changes: changes));
+}
 
 Future<void> _pumpPaintWork(WidgetTester tester) async {
   for (var i = 0; i < 12; i++) {

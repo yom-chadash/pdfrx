@@ -250,6 +250,7 @@ class _PdfViewerState extends State<PdfViewer>
   late final AnimationController _animController;
   Animation<Matrix4>? _animGoTo;
   int _animationResettingGuard = 0;
+  int _navigationGeneration = 0;
 
   PdfDocument? _document;
   PdfPageLayout? _layout;
@@ -383,6 +384,7 @@ class _PdfViewerState extends State<PdfViewer>
       _visibilityGeneration++;
       if (!widget.params.isVisible) {
         _interactionDelegate?.stop();
+        _navigationGeneration++;
         _animController.stop();
         _selectionHandleTicker?.stop();
         _selectionHandleGlobalPosition = null;
@@ -487,6 +489,8 @@ class _PdfViewerState extends State<PdfViewer>
     }
 
     _documentGeneration++;
+    _navigationGeneration++;
+    _animController.stop();
 
     if (Pdfrx.debugLazyLoading) {
       final listenable = widget.documentRef.resolveListenable();
@@ -659,6 +663,7 @@ class _PdfViewerState extends State<PdfViewer>
     _imageCache.cancelAllPendingRenderings();
     _magnifierImageCache.cancelAllPendingRenderings();
     _completeInitialPageImageWaiter();
+    _navigationGeneration++;
     _animController.dispose();
     widget.documentRef.resolveListenable().removeListener(_onDocumentChanged);
     _imageCache.releaseAllImages();
@@ -975,7 +980,7 @@ class _PdfViewerState extends State<PdfViewer>
   void _updateLayout(Size viewSize) {
     if (viewSize.height <= 0) return; // For fix blank pdf when restore window from minimize on Windows
     final documentGeneration = _documentGeneration;
-    final currentPageNumber = _guessCurrentPageNumber();
+    var currentPageNumber = _guessCurrentPageNumber();
     final oldSnapshot = PdfViewerLayoutSnapshot(
       viewSize: _viewSize ?? Size.zero,
       layout: _layout,
@@ -983,12 +988,24 @@ class _PdfViewerState extends State<PdfViewer>
       coverScale: _layoutMetrics.coverScale,
       alternativeFitScale: _layoutMetrics.alternativeFitScale,
     );
-    final oldVisibleRect = _initialized ? _visibleRect : Rect.zero;
+    var oldVisibleRect = _initialized ? _visibleRect : Rect.zero;
     final oldSize = _viewSize;
     final isViewSizeChanged = oldSize != viewSize;
     _viewSize = viewSize;
     if (isViewSizeChanged) _layoutDirty = true;
-    final isLayoutChanged = _relayoutPages();
+    final isLayoutChanged = _relayoutPages(
+      beforeLayoutChange: () {
+        if (_animGoTo == null || !_animController.isAnimating) return;
+        // Preserve the requested destination, not an intermediate animation frame.
+        _txController.runWithDeferredNotifications(() {
+          _animController.stop(canceled: false);
+          _animController.value = 1;
+        });
+        oldVisibleRect = _txController.value.calcVisibleRect(oldSnapshot.viewSize);
+        currentPageNumber = _guessCurrentPageNumber(visibleRect: oldVisibleRect);
+      },
+    );
+    final navigationGeneration = _navigationGeneration;
 
     _recalculateMetrics();
     _calcZoomStopTable();
@@ -1075,7 +1092,10 @@ class _PdfViewerState extends State<PdfViewer>
       });
     } else if (isLayoutChanged || isViewSizeChanged) {
       Future.microtask(() {
-        if (!mounted || documentGeneration != _documentGeneration || _controller?.isReady != true) {
+        if (!mounted ||
+            documentGeneration != _documentGeneration ||
+            navigationGeneration != _navigationGeneration ||
+            _controller?.isReady != true) {
           return;
         }
 
@@ -1321,13 +1341,13 @@ class _PdfViewerState extends State<PdfViewer>
     }
   }
 
-  int? _guessCurrentPageNumber() {
+  int? _guessCurrentPageNumber({Rect? visibleRect}) {
     if (_layout == null || _viewSize == null) return null;
+    visibleRect ??= _visibleRect;
     if (widget.params.calculateCurrentPageNumber != null) {
-      return widget.params.calculateCurrentPageNumber!(_visibleRect, _layout!.pageLayouts, _controller!);
+      return widget.params.calculateCurrentPageNumber!(visibleRect, _layout!.pageLayouts, _controller!);
     }
 
-    final visibleRect = _visibleRect;
     final layout = _layout!;
     final isHorizontal = layout.documentSize.width > layout.documentSize.height;
     final isSimple = _isSimplePageLayout;
@@ -1425,7 +1445,7 @@ class _PdfViewerState extends State<PdfViewer>
   }
 
   /// Returns true if page layouts are changed.
-  bool _relayoutPages() {
+  bool _relayoutPages({VoidCallback? beforeLayoutChange}) {
     if (_document == null) {
       _layout = null;
       _pageLayoutIndex = null;
@@ -1440,6 +1460,7 @@ class _PdfViewerState extends State<PdfViewer>
       return false;
     }
 
+    beforeLayoutChange?.call();
     _layout = newLayout;
     _pageLayoutIndex = PageLayoutIndex(newLayout.pageLayouts);
     _isSimplePageLayout = _isSimpleLayout(
@@ -3028,27 +3049,36 @@ class _PdfViewerState extends State<PdfViewer>
     Duration duration = const Duration(milliseconds: 200),
     PdfPageAnchor? anchor,
   }) async {
+    if (destination == null) return; // do nothing
+    final generation = ++_navigationGeneration;
+    Animation<Matrix4>? animation;
     void update() {
-      if (_animationResettingGuard != 0) return;
-      _txController.setValueWithoutNormalization(_animGoTo!.value);
+      if (_animationResettingGuard != 0 || generation != _navigationGeneration || !mounted) return;
+      _txController.setValueWithoutNormalization(animation!.value);
     }
 
     try {
-      if (destination == null) return; // do nothing
       _stopInteractiveViewerAnimation();
       _animationResettingGuard++;
       _animController.reset();
       _animationResettingGuard--;
       final destinationInSafeRange = _makeMatrixInSafeRange(destination, forceClamp: true, anchor: anchor);
       if (duration == Duration.zero) {
+        _animGoTo = null;
         _txController.setValueWithoutNormalization(destinationInSafeRange);
         return;
       }
-      _animGoTo = Matrix4Tween(begin: _txController.value, end: destinationInSafeRange).animate(_animController);
-      _animGoTo!.addListener(update);
-      await _animController.animateTo(1.0, duration: duration, curve: Curves.easeInOut);
+      animation = _animGoTo = Matrix4Tween(
+        begin: _txController.value,
+        end: destinationInSafeRange,
+      ).animate(_animController);
+      animation.addListener(update);
+      await _animController.animateTo(1.0, duration: duration, curve: Curves.easeInOut).orCancel;
+    } on TickerCanceled {
+      // A newer navigation or a detached document owns the viewport now.
     } finally {
-      _animGoTo?.removeListener(update);
+      animation?.removeListener(update);
+      if (identical(_animGoTo, animation)) _animGoTo = null;
     }
   }
 
@@ -3108,7 +3138,7 @@ class _PdfViewerState extends State<PdfViewer>
     }
     _gotoTargetPageNumber = pageNumber;
 
-    await _goTo(
+    final navigation = _goTo(
       _calcMatrixForClampedToNearestBoundary(
         _calcMatrixForPage(pageNumber: targetPageNumber, anchor: anchor),
         viewSize: _viewSize!,
@@ -3117,7 +3147,9 @@ class _PdfViewerState extends State<PdfViewer>
       duration: duration,
       anchor: anchor,
     );
-    _setCurrentPageNumber(targetPageNumber);
+    final generation = _navigationGeneration;
+    await navigation;
+    if (mounted && generation == _navigationGeneration) _setCurrentPageNumber(targetPageNumber);
   }
 
   /// Scrolls/zooms so that the specified PDF document coordinate appears at
@@ -3149,12 +3181,14 @@ class _PdfViewerState extends State<PdfViewer>
     Duration duration = const Duration(milliseconds: 200),
   }) async {
     _gotoTargetPageNumber = pageNumber;
-    await _goTo(
+    final navigation = _goTo(
       _calcMatrixForRectInsidePage(pageNumber: pageNumber, rect: rect, anchor: anchor),
       duration: duration,
       anchor: anchor,
     );
-    _setCurrentPageNumber(pageNumber);
+    final generation = _navigationGeneration;
+    await navigation;
+    if (mounted && generation == _navigationGeneration) _setCurrentPageNumber(pageNumber);
   }
 
   Future<bool> _goToDest(PdfDest? dest, {Duration duration = const Duration(milliseconds: 200)}) async {
@@ -3163,8 +3197,10 @@ class _PdfViewerState extends State<PdfViewer>
     if (dest != null) {
       _gotoTargetPageNumber = dest.pageNumber;
     }
-    await _goTo(m, duration: duration);
-    if (dest != null) {
+    final navigation = _goTo(m, duration: duration);
+    final generation = _navigationGeneration;
+    await navigation;
+    if (mounted && generation == _navigationGeneration && dest != null) {
       _setCurrentPageNumber(dest.pageNumber);
     }
     return true;
