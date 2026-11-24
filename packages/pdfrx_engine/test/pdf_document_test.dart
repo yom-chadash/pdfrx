@@ -11,6 +11,7 @@ import 'package:test/test.dart';
 
 import 'utils.dart';
 import 'hebrew_native.dart';
+import 'native_missing_fonts.dart';
 import 'progressive_text_native.dart';
 
 final testPdfFile = File('../pdfrx/example/viewer/assets/hello.pdf');
@@ -103,6 +104,7 @@ void main() {
   });
 
   registerHebrewNativeTests();
+  registerNativeMissingFontTests();
   registerProgressiveTextNativeTests();
   setUp(() => pdfrxInitialize(tmpPath: tmpRoot.path));
 
