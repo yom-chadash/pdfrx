@@ -369,6 +369,93 @@ void main() {
     await tester.pump(const Duration(milliseconds: 100));
   });
 
+  testWidgets('immutable custom layouts keep their revision until changed geometry is returned', (tester) async {
+    final document = _TestDocument(1);
+    addTearDown(document.dispose);
+    final controller = PdfViewerController();
+    var custom = PdfPageLayout.immutable(
+      pageLayouts: [const Rect.fromLTWH(0, 0, 600, 800)],
+      documentSize: const Size(800, 800),
+    );
+    var layoutCalls = 0;
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PdfViewer(
+          PdfDocumentRefDirect(document, autoDispose: false),
+          controller: controller,
+          params: PdfViewerParams(
+            layoutPages: (_, _) {
+              layoutCalls++;
+              return custom;
+            },
+          ),
+        ),
+      ),
+    );
+    await _pumpPaintWork(tester);
+    final callsBeforeScroll = layoutCalls;
+    for (var i = 0; i < 10; i++) {
+      controller.value = controller.value.clone()..translateByDouble(0, -1, 0, 1);
+      await tester.pump(const Duration(milliseconds: 10));
+      expect(controller.layout, same(custom));
+    }
+    expect(layoutCalls, greaterThan(callsBeforeScroll));
+
+    custom = PdfPageLayout.immutable(
+      pageLayouts: [const Rect.fromLTWH(100, 0, 600, 800)],
+      documentSize: const Size(800, 800),
+    );
+    controller.value = controller.value.clone()..translateByDouble(0, -1, 0, 1);
+    await _pumpPaintWork(tester);
+    expect(controller.layout, same(custom));
+    expect(controller.getPdfPageHitTestResult(const Offset(50, 100), useDocumentLayoutCoordinates: true), isNull);
+    expect(
+      controller.getPdfPageHitTestResult(const Offset(150, 100), useDocumentLayoutCoordinates: true)?.page.pageNumber,
+      1,
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(milliseconds: 100));
+  });
+
+  testWidgets('a geometrically equal immutable snapshot replaces a mutable layout alias', (tester) async {
+    final document = _TestDocument(1);
+    addTearDown(document.dispose);
+    final controller = PdfViewerController();
+    final mutableRects = [const Rect.fromLTWH(0, 0, 600, 800)];
+    var custom = PdfPageLayout(pageLayouts: mutableRects, documentSize: const Size(800, 800));
+    await tester.pumpWidget(
+      MaterialApp(
+        home: PdfViewer(
+          PdfDocumentRefDirect(document, autoDispose: false),
+          controller: controller,
+          params: PdfViewerParams(layoutPages: (_, _) => custom),
+        ),
+      ),
+    );
+    await _pumpPaintWork(tester);
+
+    for (var i = 0; i < 2; i++) {
+      custom = PdfPageLayout.immutable(
+        pageLayouts: [const Rect.fromLTWH(0, 0, 600, 800)],
+        documentSize: const Size(800, 800),
+      );
+      controller.invalidate();
+      await _pumpPaintWork(tester);
+      expect(controller.layout, same(custom));
+    }
+    mutableRects[0] = const Rect.fromLTWH(100, 0, 600, 800);
+    controller.value = controller.value.clone()..translateByDouble(0, -1, 0, 1);
+    await _pumpPaintWork(tester);
+    expect(controller.layout, same(custom));
+    expect(controller.layout.pageLayouts.single, const Rect.fromLTWH(0, 0, 600, 800));
+    expect(
+      controller.getPdfPageHitTestResult(const Offset(50, 100), useDocumentLayoutCoordinates: true)?.page.pageNumber,
+      1,
+    );
+    await tester.pumpWidget(const SizedBox.shrink());
+    await tester.pump(const Duration(milliseconds: 100));
+  });
+
   testWidgets('viewers of the same document share extracted page text', (tester) async {
     final document = _TestDocument(1);
     addTearDown(document.dispose);

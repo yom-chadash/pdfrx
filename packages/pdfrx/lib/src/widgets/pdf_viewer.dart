@@ -1434,7 +1434,9 @@ class _PdfViewerState extends State<PdfViewer>
     if (!_layoutDirty && _layout != null && widget.params.layoutPages == null) return false;
     final newLayout = (widget.params.layoutPages ?? _layoutPages)(_document!.pages, widget.params);
     _layoutDirty = false;
+    if (newLayout._isImmutable && identical(_layout, newLayout) && _pageLayoutIndex != null) return false;
     if (_layout?.documentSize == newLayout.documentSize && _pageLayoutIndex?.matches(newLayout.pageLayouts) == true) {
+      if (newLayout._isImmutable) _layout = newLayout;
       return false;
     }
 
@@ -5205,9 +5207,25 @@ enum PdfTextSelectionAnchorType { a, b }
 String _fmtPageSize(PdfPage page) => '${page.width.toStringAsFixed(0)}x${page.height.toStringAsFixed(0)}';
 
 class PdfPageLayout {
-  PdfPageLayout({required this.pageLayouts, required this.documentSize});
+  PdfPageLayout({required this.pageLayouts, required this.documentSize}) : _isImmutable = false;
+
+  /// Copies page rectangles and document dimensions into an immutable value snapshot.
+  ///
+  /// A custom layout callback may reuse this instance until its geometry changes. The viewer can then
+  /// reuse its spatial index without comparing every rectangle. The ordinary constructor continues to
+  /// observe changes to mutable rectangle lists on viewer updates.
+  factory PdfPageLayout.immutable({required List<Rect> pageLayouts, required Size documentSize}) =>
+      PdfPageLayout._immutable([
+        for (final rect in pageLayouts) Rect.fromLTRB(rect.left, rect.top, rect.right, rect.bottom),
+      ], Size(documentSize.width, documentSize.height));
+
+  PdfPageLayout._immutable(List<Rect> pageLayouts, this.documentSize)
+    : pageLayouts = List.unmodifiable(pageLayouts),
+      _isImmutable = true;
+
   final List<Rect> pageLayouts;
   final Size documentSize;
+  final bool _isImmutable;
 
   @override
   bool operator ==(Object other) {
